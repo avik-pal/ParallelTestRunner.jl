@@ -29,15 +29,17 @@ const ID_COUNTER = Threads.Atomic{Int}(0)
 struct PTRWorker <: Malt.AbstractWorker
     w::Malt.Worker
     io::IOBuffer
+    io_lock::ReentrantLock
     id::Int
 end
 
 function PTRWorker(; exename=Base.julia_cmd()[1], exeflags=String[], env=String[])
     io = IOBuffer()
+    io_lock = ReentrantLock()
     wrkr = Malt.Worker(; exename, exeflags, env, monitor_stdout=false, monitor_stderr=false)
-    stdio_loop(wrkr, io)
+    stdio_loop(wrkr, io, io_lock)
     id = ID_COUNTER[] += 1
-    return PTRWorker(wrkr, io, id)
+    return PTRWorker(wrkr, io, io_lock, id)
 end
 
 worker_id(wrkr::PTRWorker) = wrkr.id
@@ -86,7 +88,9 @@ struct TestRecord <: AbstractTestRecord
     time::Float64
     bytes::UInt64
     gctime::Float64
+    compile_time::Float64
     rss::UInt64
+    total_time::Float64
 end
 
 function memory_usage(rec::TestRecord)
@@ -106,17 +110,20 @@ struct TestIOContext
     stdout::IO
     stderr::IO
     color::Bool
+    verbose::Bool
     lock::ReentrantLock
     name_align::Int
     elapsed_align::Int
+    compile_align::Int
     gc_align::Int
     percent_align::Int
     alloc_align::Int
     rss_align::Int
 end
 
-function test_IOContext(stdout::IO, stderr::IO, lock::ReentrantLock, name_align::Int)
-    elapsed_align = textwidth("Time (s)")
+function test_IOContext(stdout::IO, stderr::IO, lock::ReentrantLock, name_align::Int, verbose::Bool)
+    elapsed_align = textwidth("time (s)")
+    compile_align = textwidth("Compile")
     gc_align = textwidth("GC (s)")
     percent_align = textwidth("GC %")
     alloc_align = textwidth("Alloc (MB)")
@@ -125,7 +132,7 @@ function test_IOContext(stdout::IO, stderr::IO, lock::ReentrantLock, name_align:
     color = get(stdout, :color, false)
 
     return TestIOContext(
-        stdout, stderr, color, lock, name_align, elapsed_align, gc_align, percent_align,
+        stdout, stderr, color, verbose, lock, name_align, elapsed_align, compile_align, gc_align, percent_align,
         alloc_align, rss_align
     )
 end
@@ -133,11 +140,20 @@ end
 function print_header(ctx::TestIOContext, testgroupheader, workerheader)
     lock(ctx.lock)
     try
-        printstyled(ctx.stdout, " "^(ctx.name_align + textwidth(testgroupheader) - 3), " │ ")
-        printstyled(ctx.stdout, "         │ ──────────────── CPU ──────────────── │\n", color = :white)
+        # header top
+        printstyled(ctx.stdout, " "^(ctx.name_align + textwidth(testgroupheader) - 3), " │ ", color = :white)
+        printstyled(ctx.stdout, "  Test   │", color = :white)
+        ctx.verbose && printstyled(ctx.stdout, "   Init   │", color = :white)
+        VERSION >= v"1.11" && ctx.verbose && printstyled(ctx.stdout, " Compile │", color = :white)
+        printstyled(ctx.stdout, " ──────────────── CPU ──────────────── │\n", color = :white)
+
+        # header bottom
         printstyled(ctx.stdout, testgroupheader, color = :white)
         printstyled(ctx.stdout, lpad(workerheader, ctx.name_align - textwidth(testgroupheader) + 1), " │ ", color = :white)
-        printstyled(ctx.stdout, "Time (s) │ GC (s) │ GC % │ Alloc (MB) │ RSS (MB) │\n", color = :white)
+        printstyled(ctx.stdout, "time (s) │", color = :white)
+        ctx.verbose && printstyled(ctx.stdout, " time (s) │", color = :white)
+        VERSION >= v"1.11" && ctx.verbose && printstyled(ctx.stdout, "   (%)   │", color = :white)
+        printstyled(ctx.stdout, " GC (s) │ GC % │ Alloc (MB) │ RSS (MB) │\n", color = :white)
         flush(ctx.stdout)
     finally
         unlock(ctx.lock)
@@ -163,8 +179,21 @@ function print_test_finished(record::TestRecord, wrkr, test, ctx::TestIOContext)
     try
         printstyled(ctx.stdout, test, color = :white)
         printstyled(ctx.stdout, lpad("($wrkr)", ctx.name_align - textwidth(test) + 1, " "), " │ ", color = :white)
+
         time_str = @sprintf("%7.2f", record.time)
         printstyled(ctx.stdout, lpad(time_str, ctx.elapsed_align, " "), " │ ", color = :white)
+
+        if ctx.verbose
+            # pre-testset time
+            init_time_str = @sprintf("%7.2f", record.total_time - record.time)
+            printstyled(ctx.stdout, lpad(init_time_str, ctx.elapsed_align, " "), " │ ", color = :white)
+
+            # compilation time
+            if VERSION >= v"1.11"
+                init_time_str = @sprintf("%7.2f", Float64(100*record.compile_time/record.time))
+                printstyled(ctx.stdout, lpad(init_time_str, ctx.compile_align, " "), " │ ", color = :white)
+            end
+        end
 
         gc_str = @sprintf("%5.2f", record.gctime)
         printstyled(ctx.stdout, lpad(gc_str, ctx.gc_align, " "), " │ ", color = :white)
@@ -188,14 +217,20 @@ function print_test_failed(record::TestRecord, wrkr, test, ctx::TestIOContext)
         printstyled(ctx.stderr, test, color = :red)
         printstyled(
             ctx.stderr,
-            lpad("($wrkr)", ctx.name_align - textwidth(test) + 1, " "), " |"
+            lpad("($wrkr)", ctx.name_align - textwidth(test) + 1, " "), " │"
             , color = :red
         )
+
         time_str = @sprintf("%7.2f", record.time)
         printstyled(ctx.stderr, lpad(time_str, ctx.elapsed_align + 1, " "), " │", color = :red)
 
+        if ctx.verbose
+            init_time_str = @sprintf("%7.2f", record.total_time - record.time)
+            printstyled(ctx.stdout, lpad(init_time_str, ctx.elapsed_align + 1, " "), " │ ", color = :red)
+        end
+
         failed_str = "failed at $(now())\n"
-        # 11 -> 3 from " | " 3x and 2 for each " " on either side
+        # 11 -> 3 from " │ " 3x and 2 for each " " on either side
         fail_align = (11 + ctx.gc_align + ctx.percent_align + ctx.alloc_align + ctx.rss_align - textwidth(failed_str)) ÷ 2 + textwidth(failed_str)
         failed_str = lpad(failed_str, fail_align, " ")
         printstyled(ctx.stderr, failed_str, color = :red)
@@ -214,7 +249,7 @@ function print_test_crashed(wrkr, test, ctx::TestIOContext)
         printstyled(ctx.stderr, test, color = :red)
         printstyled(
             ctx.stderr,
-            lpad("($wrkr)", ctx.name_align - textwidth(test) + 1, " "), " |",
+            lpad("($wrkr)", ctx.name_align - textwidth(test) + 1, " "), " │",
             " "^ctx.elapsed_align, " crashed at $(now())\n", color = :red
         )
 
@@ -225,11 +260,11 @@ function print_test_crashed(wrkr, test, ctx::TestIOContext)
 end
 
 # Adapted from `Malt._stdio_loop`
-function stdio_loop(worker::Malt.Worker, io)
+function stdio_loop(worker::Malt.Worker, io, io_lock::ReentrantLock)
     Threads.@spawn while !eof(worker.stdout) && Malt.isrunning(worker)
         try
             bytes = readavailable(worker.stdout)
-            write(io, bytes)
+            @lock io_lock write(io, bytes)
         catch
             break
         end
@@ -237,7 +272,7 @@ function stdio_loop(worker::Malt.Worker, io)
     Threads.@spawn while !eof(worker.stderr) && Malt.isrunning(worker)
         try
             bytes = readavailable(worker.stderr)
-            write(io, bytes)
+            @lock io_lock write(io, bytes)
         catch
             break
         end
@@ -278,7 +313,7 @@ function Test.finish(ts::WorkerTestSet)
     return ts.wrapped_ts
 end
 
-function runtest(f, name, init_code)
+function runtest(f, name, init_code, start_time)
     function inner()
         # generate a temporary module to execute the tests in
         mod = @eval(Main, module $(gensym(name)) end)
@@ -302,12 +337,14 @@ function runtest(f, name, init_code)
                     $f
                 end
             end
-            (; testset=stats.value, stats.time, stats.bytes, stats.gctime)
+
+            compile_time = @static VERSION >= v"1.11" ? stats.compile_time : 0.0
+            (; testset=stats.value, stats.time, stats.bytes, stats.gctime, compile_time)
         end
 
         # process results
         rss = Sys.maxrss()
-        record = TestRecord(data..., rss)
+        record = TestRecord(data..., rss, time() - start_time)
 
         GC.gc(true)
         return record
@@ -790,12 +827,18 @@ function runtests(mod::Module, args::ParsedArgs;
     jobs = something(args.jobs, default_njobs())
     jobs = clamp(jobs, 1, length(tests))
     println(stdout, "Running $(length(tests)) tests using $jobs parallel jobs. If this is too many concurrent jobs, specify the `--jobs=N` argument to the tests, or set the `JULIA_CPU_THREADS` environment variable.")
-    workers = fill(nothing, jobs)
+    !isnothing(args.verbose) && println(stdout, "Available memory: $(Base.format_bytes(available_memory()))")
+    sem = Base.Semaphore(max(1, jobs))
+    worker_pool = Channel{Union{Nothing, PTRWorker}}(jobs)
+    for _ in 1:jobs
+        put!(worker_pool, nothing)
+    end
 
     t0 = time()
     results = []
     running_tests = Dict{String, Float64}()  # test => start_time
     test_lock = ReentrantLock() # to protect crucial access to tests and running_tests
+    results_lock = ReentrantLock() # to protect concurrent access to results
 
     worker_tasks = Task[]
 
@@ -831,7 +874,7 @@ function runtests(mod::Module, args::ParsedArgs;
         stderr.lock = print_lock
     end
 
-    io_ctx = test_IOContext(stdout, stderr, print_lock, name_align)
+    io_ctx = test_IOContext(stdout, stderr, print_lock, name_align, !isnothing(args.verbose))
     print_header(io_ctx, testgroupheader, workerheader)
 
     status_lines_visible = Ref(0)
@@ -850,8 +893,8 @@ function runtests(mod::Module, args::ParsedArgs;
     function update_status()
         # only draw if we have something to show
         isempty(running_tests) && return
-        completed = length(results)
-        total = completed + length(tests) + length(running_tests)
+        completed = Base.@lock results_lock length(results)
+        total = length(tests)
 
         # line 1: empty line
         line1 = ""
@@ -872,7 +915,7 @@ function runtests(mod::Module, args::ParsedArgs;
         line3 = "Progress: $completed/$total tests completed"
         if completed > 0
             # estimate per-test time (slightly pessimistic)
-            durations_done = [end_time - start_time for (_, _,_, start_time, end_time) in results]
+            durations_done = Base.@lock results_lock [end_time - start_time for (_, _,_, start_time, end_time) in results]
             μ = mean(durations_done)
             σ = length(durations_done) > 1 ? std(durations_done) : 0.0
             est_per_test = μ + 0.5σ
@@ -886,12 +929,15 @@ function runtests(mod::Module, args::ParsedArgs;
             end
             ## yet-to-run
             for test in tests
+                haskey(running_tests, test) && continue
+                # Test is in any completed test
+                any(r -> test == r.test, results) && continue
                 est_remaining += get(historical_durations, test, est_per_test)
             end
 
             eta_sec = est_remaining / jobs
             eta_mins = round(Int, eta_sec / 60)
-            line3 *= " | ETA: ~$eta_mins min"
+            line3 *= " │ ETA: ~$eta_mins min"
         end
 
         # only display the status bar on actual terminals
@@ -968,7 +1014,7 @@ function runtests(mod::Module, args::ParsedArgs;
             end
             isa(ex, InterruptException) || rethrow()
         finally
-            if isempty(tests) && isempty(running_tests)
+            if isempty(running_tests) && length(results) >= length(tests)
                 # XXX: only erase the status if we completed successfully.
                 #      in other cases we'll have printed "caught interrupt"
                 clear_status()
@@ -976,121 +1022,122 @@ function runtests(mod::Module, args::ParsedArgs;
         end
     end
 
-
     #
     # execution
     #
 
-    for p in workers
-        push!(worker_tasks, @async begin
-            while !done
-                # get a test to run
-                test, test_t0 = Base.@lock test_lock begin
-                    isempty(tests) && break
-                    test = popfirst!(tests)
+    tests_to_start = Threads.Atomic{Int}(length(tests))
+    try
+        @sync for test in tests
+            push!(worker_tasks, Threads.@spawn begin
+                local p = nothing
+                acquired = false
+                try
+                    Base.acquire(sem)
+                    acquired = true
+                    p = take!(worker_pool)
+                    Threads.atomic_sub!(tests_to_start, 1)
 
-                    test_t0 = time()
-                    running_tests[test] = test_t0
+                    done && return
 
-                    test, test_t0
-                end
-
-                # pass in init_worker_code to custom worker function if defined
-                wrkr = if init_worker_code == :()
-                    test_worker(test)
-                else
-                    test_worker(test, init_worker_code)
-                end
-                if wrkr === nothing
-                    wrkr = p
-                end
-                # if a worker failed, spawn a new one
-                if wrkr === nothing || !Malt.isrunning(wrkr)
-                    wrkr = p = addworker(; init_worker_code, io_ctx.color)
-                end
-
-                # run the test
-                put!(printer_channel, (:started, test, worker_id(wrkr)))
-                result = try
-                    Malt.remote_eval_wait(Main, wrkr.w, :(import ParallelTestRunner))
-                    Malt.remote_call_fetch(invokelatest, wrkr.w, runtest,
-                                           testsuite[test], test, init_code)
-                catch ex
-                    if isa(ex, InterruptException)
-                        # the worker got interrupted, signal other tasks to stop
-                        stop_work()
-                        break
+                    test_t0 = Base.@lock test_lock begin
+                        test_t0 = time()
+                        running_tests[test] = test_t0
                     end
 
-                    ex
-                end
-                test_t1 = time()
-                output = String(take!(wrkr.io))
-                push!(results, (test, result, output, test_t0, test_t1))
-
-                # act on the results
-                if result isa AbstractTestRecord
-                    put!(printer_channel, (:finished, test, worker_id(wrkr), result))
-                    if anynonpass(result[]) && args.quickfail !== nothing
-                        stop_work()
-                        break
+                    # pass in init_worker_code to custom worker function if defined
+                    wrkr = if init_worker_code == :()
+                        test_worker(test)
+                    else
+                        test_worker(test, init_worker_code)
+                    end
+                    if wrkr === nothing
+                        wrkr = p
+                    end
+                    # if a worker failed, spawn a new one
+                    if wrkr === nothing || !Malt.isrunning(wrkr)
+                        wrkr = p = addworker(; init_worker_code, io_ctx.color)
                     end
 
-                    if memory_usage(result) > max_worker_rss
-                        # the worker has reached the max-rss limit, recycle it
-                        # so future tests start with a smaller working set
+                    # run the test
+                    put!(printer_channel, (:started, test, worker_id(wrkr)))
+                    result = try
+                        Malt.remote_eval_wait(Main, wrkr.w, :(import ParallelTestRunner))
+                        Malt.remote_call_fetch(invokelatest, wrkr.w, runtest,
+                                               testsuite[test], test, init_code, test_t0)
+                    catch ex
+                        if isa(ex, InterruptException)
+                            # the worker got interrupted, signal other tasks to stop
+                            stop_work()
+                            return
+                        end
+
+                        ex
+                    end
+                    test_t1 = time()
+                    output = Base.@lock wrkr.io_lock String(take!(wrkr.io))
+                    Base.@lock results_lock push!(results, (; test, result, output, test_t0, test_t1))
+
+                    # act on the results
+                    if result isa AbstractTestRecord
+                        put!(printer_channel, (:finished, test, worker_id(wrkr), result))
+                        if anynonpass(result[]) && args.quickfail !== nothing
+                            stop_work()
+                            return
+                        end
+
+                        if memory_usage(result) > max_worker_rss
+                            # the worker has reached the max-rss limit, recycle it
+                            # so future tests start with a smaller working set
+                            Malt.stop(wrkr)
+                        end
+                    else
+                        # One of Malt.TerminatedWorkerException, Malt.RemoteException, or ErrorException
+                        @assert result isa Exception
+                        put!(printer_channel, (:crashed, test, worker_id(wrkr)))
+                        if args.quickfail !== nothing
+                            stop_work()
+                            return
+                        end
+
+                        # the worker encountered some serious failure, recycle it
                         Malt.stop(wrkr)
                     end
-                else
-                    # One of Malt.TerminatedWorkerException, Malt.RemoteException, or ErrorException
-                    @assert result isa Exception
-                    put!(printer_channel, (:crashed, test, worker_id(wrkr)))
-                    if args.quickfail !== nothing
-                        stop_work()
-                        break
+
+                    # get rid of the custom worker
+                    if wrkr != p
+                        Malt.stop(wrkr)
                     end
 
-                    # the worker encountered some serious failure, recycle it
-                    Malt.stop(wrkr)
+                    Base.@lock test_lock begin
+                        delete!(running_tests, test)
+                    end
+                catch ex
+                    isa(ex, InterruptException) || rethrow()
+                finally
+                    if acquired
+                        # stop the worker if no more tests will need one from the pool
+                        if tests_to_start[] == 0 && p !== nothing && Malt.isrunning(p)
+                            Malt.stop(p)
+                            p = nothing
+                        end
+                        put!(worker_pool, p)
+                        Base.release(sem)
+                    end
                 end
-
-                # get rid of the custom worker
-                if wrkr != p
-                    Malt.stop(wrkr)
-                end
-
-                Base.@lock test_lock begin
-                    delete!(running_tests, test)
-                end
-            end
-            if p !== nothing
-                Malt.stop(p)
-            end
-        end)
+            end)
+        end
+    catch err
+        if !(err isa InterruptException)
+            println(io_ctx.stderr, "\nCaught an error, stopping...")
+        end
+    finally
+        stop_work()
     end
-
 
     #
     # finalization
     #
-
-    # monitor worker tasks for failure so that each one doesn't need a try/catch + stop_work()
-    try
-        while true
-            if any(istaskfailed, worker_tasks)
-                println(io_ctx.stderr, "\nCaught an error, stopping...")
-                break
-            elseif done || Base.@lock(test_lock, isempty(tests) && isempty(running_tests))
-                break
-            end
-            sleep(1)
-        end
-    catch err
-        # in case the sleep got interrupted
-        isa(err, InterruptException) || rethrow()
-    finally
-        stop_work()
-    end
 
     # wait for the printer to finish so that all results have been printed
     close(printer_channel)
@@ -1107,6 +1154,14 @@ function runtests(mod::Module, args::ParsedArgs;
             end
 
             isa(err, InterruptException) || rethrow()
+        end
+    end
+
+    # clean up remaining workers in the pool
+    close(worker_pool)
+    for p in worker_pool
+        if p !== nothing && Malt.isrunning(p)
+            Malt.stop(p)
         end
     end
 
@@ -1191,7 +1246,7 @@ function runtests(mod::Module, args::ParsedArgs;
             end
 
             # mark remaining or running tests as interrupted
-            for test in [tests; collect(keys(running_tests))]
+            for test in tests
                 (test in completed_tests) && continue
                 testset = create_testset(test)
                 Test.record(testset, Test.Error(:test_interrupted, test, nothing, Base.ExceptionStack(NamedTuple[(;exception = "skipped", backtrace = [])]), LineNumberNode(1)))
