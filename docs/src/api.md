@@ -39,12 +39,27 @@ addworkers
 default_njobs
 ```
 
-## Internal Types
+## Custom Records
 
-These are internal types, not subject to semantic versioning contract (could be changed or removed at any point without notice), not intended for consumption by end-users.
+Per-test data is captured in an [`AbstractTestRecord`](@ref). The default
+[`TestRecord`](@ref) stores timing and memory statistics; subtypes can wrap it
+to collect additional data (e.g. GPU metrics) by dispatching [`execute`](@ref)
+on the new type and reading the baseline through [`parent`](@ref).
+
+```@docs
+AbstractTestRecord
+TestRecord
+execute
+parent(::ParallelTestRunner.AbstractTestRecord)
+```
+
+## Internal Functionalities
+
+These are internal types or functions, not subject to semantic versioning contract (could be changed or removed at any point without notice), not intended for consumption by end-users.
 They are documented here exclusively for `ParallelTestRunner` developers and contributors.
 
 ```@docs
 ParsedArgs
 WorkerTestSet
+partition_tests
 ```
